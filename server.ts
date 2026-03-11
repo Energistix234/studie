@@ -73,6 +73,17 @@ async function startServer() {
     res.json({ id, name });
   });
 
+  app.put('/api/decks/:id', (req, res) => {
+    const { name } = req.body;
+    db.prepare('UPDATE decks SET name = ? WHERE id = ?').run(name, req.params.id);
+    res.json({ id: req.params.id, name });
+  });
+
+  app.delete('/api/decks/:id', (req, res) => {
+    db.prepare('DELETE FROM decks WHERE id = ?').run(req.params.id);
+    res.json({ success: true });
+  });
+
   // Cards
   app.get('/api/decks/:deckId/cards', (req, res) => {
     const { deckId } = req.params;
@@ -90,19 +101,22 @@ async function startServer() {
   });
 
   app.post('/api/cards', async (req, res) => {
-    const { deck_id, type, front, back, image_url, masks } = req.body;
+    const { deck_id, type, front, back, image_url, masks, options } = req.body;
     const id = uuidv4();
-    
+
     let embeddingStr = null;
     try {
       const aiClient = getAi();
-      // Combine text to embed
       let textToEmbed = front || '';
       if (back) textToEmbed += ' ' + back;
       if (type === 'image_occlusion' && masks) {
         textToEmbed += ' ' + masks.map((m: any) => m.text).join(' ');
       }
-      
+      if (type === 'multiple_choice' && options) {
+        const opts = typeof options === 'string' ? JSON.parse(options) : options;
+        textToEmbed += ' ' + opts.map((o: any) => o.text).join(' ');
+      }
+
       if (textToEmbed.trim()) {
         const result = await aiClient.models.embedContent({
           model: 'gemini-embedding-2-preview',
@@ -114,13 +128,14 @@ async function startServer() {
       }
     } catch (err) {
       console.error('Failed to generate embedding:', err);
-      // Continue without embedding if it fails
     }
-    
+
+    const optionsStr = options ? (typeof options === 'string' ? options : JSON.stringify(options)) : null;
+
     const insertCard = db.transaction(() => {
-      db.prepare('INSERT INTO cards (id, deck_id, type, front, back, image_url, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .run(id, deck_id, type, front, back, image_url, embeddingStr);
-        
+      db.prepare('INSERT INTO cards (id, deck_id, type, front, back, image_url, options, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(id, deck_id, type, front, back, image_url, optionsStr, embeddingStr);
+
       if (type === 'image_occlusion' && masks && Array.isArray(masks)) {
         const insertMask = db.prepare('INSERT INTO image_masks (id, card_id, x, y, width, height, text) VALUES (?, ?, ?, ?, ?, ?, ?)');
         for (const mask of masks) {
@@ -128,9 +143,41 @@ async function startServer() {
         }
       }
     });
-    
+
     insertCard();
-    res.json({ id, deck_id, type, front, back, image_url });
+    res.json({ id, deck_id, type, front, back, image_url, options: optionsStr });
+  });
+
+  app.put('/api/cards/:id', async (req, res) => {
+    const { front, back, type, options } = req.body;
+    const optionsStr = options ? (typeof options === 'string' ? options : JSON.stringify(options)) : null;
+
+    let embeddingStr = null;
+    try {
+      const aiClient = getAi();
+      let textToEmbed = front || '';
+      if (back) textToEmbed += ' ' + back;
+      if (textToEmbed.trim()) {
+        const result = await aiClient.models.embedContent({
+          model: 'gemini-embedding-2-preview',
+          contents: [textToEmbed],
+        });
+        if (result.embeddings && result.embeddings.length > 0) {
+          embeddingStr = JSON.stringify(result.embeddings[0].values);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to regenerate embedding:', err);
+    }
+
+    db.prepare('UPDATE cards SET front = ?, back = ?, type = ?, options = ?, embedding = COALESCE(?, embedding) WHERE id = ?')
+      .run(front, back, type, optionsStr, embeddingStr, req.params.id);
+    res.json({ id: req.params.id, front, back, type, options: optionsStr });
+  });
+
+  app.delete('/api/cards/:id', (req, res) => {
+    db.prepare('DELETE FROM cards WHERE id = ?').run(req.params.id);
+    res.json({ success: true });
   });
 
   // Backfill Embeddings
@@ -245,6 +292,57 @@ async function startServer() {
     }
   });
 
+  // Reviews
+  app.post('/api/reviews', (req, res) => {
+    const { card_id, rating } = req.body;
+    const id = uuidv4();
+    db.prepare('INSERT INTO reviews (id, card_id, rating) VALUES (?, ?, ?)').run(id, card_id, rating);
+    res.json({ id, card_id, rating });
+  });
+
+  // Document Preview (for page/slide count + thumbnails)
+  app.post('/api/document-preview', upload.single('document'), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'No document uploaded' });
+      }
+
+      const ext = path.extname(req.file.originalname).toLowerCase();
+
+      if (ext === '.pdf') {
+        const data = await pdfParse(fs.readFileSync(req.file.path));
+        res.json({ pageCount: data.numpages, slideImages: [] });
+      } else if (ext === '.pptx') {
+        const zip = new AdmZip(req.file.path);
+        const zipEntries = zip.getEntries();
+
+        // Count slides
+        const slideEntries = zipEntries.filter(
+          (e: any) => e.entryName.startsWith('ppt/slides/slide') && e.entryName.endsWith('.xml')
+        );
+
+        // Extract thumbnail images from ppt/media/ for preview
+        const slideImages: string[] = [];
+        for (const entry of zipEntries) {
+          if (entry.entryName.startsWith('ppt/media/') &&
+            (entry.entryName.endsWith('.png') || entry.entryName.endsWith('.jpg') || entry.entryName.endsWith('.jpeg'))) {
+            const imgExt = path.extname(entry.entryName);
+            const filename = Date.now() + '-' + Math.round(Math.random() * 1E9) + imgExt;
+            fs.writeFileSync(path.join(uploadDir, filename), entry.getData());
+            slideImages.push(`/uploads/${filename}`);
+          }
+        }
+
+        res.json({ pageCount: slideEntries.length, slideImages });
+      } else {
+        res.json({ pageCount: 1, slideImages: [] });
+      }
+    } catch (error: any) {
+      console.error('Error getting document preview:', error);
+      res.status(500).json({ error: 'Failed to preview document', details: error.message });
+    }
+  });
+
   // Document Upload Pipeline
   app.post('/api/upload-document', upload.single('document'), async (req, res) => {
     try {
@@ -256,14 +354,51 @@ async function startServer() {
       let extractedText = '';
       let extractedImages: string[] = [];
 
+      // Parse selected pages from request body
+      let selectedPages: number[] | null = null;
+      if (req.body.pages) {
+        try {
+          selectedPages = JSON.parse(req.body.pages);
+        } catch (e) {
+          // ignore parse error
+        }
+      }
+
       if (ext === '.pdf') {
-        const data = await pdfParse(fs.readFileSync(req.file.path));
-        extractedText = data.text;
+        const pdfBuffer = fs.readFileSync(req.file.path);
+        if (selectedPages && selectedPages.length > 0) {
+          // Use page render callback to filter pages
+          const selectedSet = new Set(selectedPages);
+          let currentPage = 0;
+          const data = await pdfParse(pdfBuffer, {
+            pagerender: function (pageData: any) {
+              currentPage++;
+              if (selectedSet.has(currentPage)) {
+                return pageData.getTextContent().then((textContent: any) => {
+                  return textContent.items.map((item: any) => item.str).join(' ');
+                });
+              }
+              return Promise.resolve('');
+            }
+          });
+          extractedText = data.text;
+        } else {
+          const data = await pdfParse(pdfBuffer);
+          extractedText = data.text;
+        }
       } else if (ext === '.pptx') {
         const zip = new AdmZip(req.file.path);
         const zipEntries = zip.getEntries();
+        const selectedSet = selectedPages ? new Set(selectedPages) : null;
+
         for (const entry of zipEntries) {
           if (entry.entryName.startsWith('ppt/slides/slide') && entry.entryName.endsWith('.xml')) {
+            // Extract slide number from filename (e.g., slide3.xml -> 3)
+            const match = entry.entryName.match(/slide(\d+)\.xml$/);
+            const slideNum = match ? parseInt(match[1]) : 0;
+
+            if (selectedSet && !selectedSet.has(slideNum)) continue;
+
             const content = entry.getData().toString('utf8');
             extractedText += content.replace(/<[^>]+>/g, ' ') + '\n';
           }
@@ -286,14 +421,18 @@ async function startServer() {
       if (extractedText.trim()) {
         try {
           const aiClient = getAi();
-          const prompt = `Generate a set of flashcards from the following text. Create a mix of Q&A cards and Cloze deletion cards.
-          For Q&A, provide 'front' (question) and 'back' (answer).
-          For Cloze, provide 'front' (the sentence with the cloze deletion like {{c1::hidden text}}) and 'back' (the full sentence or explanation).
-          Return ONLY a JSON array of objects with 'type' ('qa' or 'cloze'), 'front', and 'back'.
-          
-          Text:
-          ${extractedText.substring(0, 30000)} // Limit text to avoid token limits
-          `;
+          const prompt = `Generate a diverse set of high-quality practice flashcards from the following text. Create a mix of different card types:
+
+1. "qa" - Standard question/answer cards for key facts and concepts.
+2. "cloze" - Fill-in-the-blank cards using {{c1::hidden text}} format.
+3. "open" - Open-ended questions requiring detailed written responses (definitions, explanations, comparisons). Front = question, back = model answer.
+4. "multiple_choice" - Multiple choice questions with exactly 4 options. Front = question, back = correct answer text. Include an "options" array with 4 objects: { "text": "option text", "correct": true/false }. Exactly one option must be correct.
+
+Return a JSON array. Each object has: type, front, back, and optionally options (for multiple_choice only).
+
+Text:
+${extractedText.substring(0, 30000)}
+`;
 
           const response = await aiClient.models.generateContent({
             model: 'gemini-3-flash-preview',
@@ -305,9 +444,21 @@ async function startServer() {
                 items: {
                   type: Type.OBJECT,
                   properties: {
-                    type: { type: Type.STRING, description: "Either 'qa' or 'cloze'" },
+                    type: { type: Type.STRING, description: "One of: 'qa', 'cloze', 'open', 'multiple_choice'" },
                     front: { type: Type.STRING },
-                    back: { type: Type.STRING }
+                    back: { type: Type.STRING },
+                    options: {
+                      type: Type.ARRAY,
+                      description: "Only for multiple_choice type. Exactly 4 options.",
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          text: { type: Type.STRING },
+                          correct: { type: Type.BOOLEAN }
+                        },
+                        required: ["text", "correct"]
+                      }
+                    }
                   },
                   required: ["type", "front", "back"]
                 }

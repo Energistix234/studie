@@ -54,6 +54,12 @@ export function initDb() {
   } catch (e) {
     // Column might already exist
   }
+
+  try {
+    db.exec(`ALTER TABLE cards ADD COLUMN options TEXT;`);
+  } catch (e) {
+    // Column might already exist
+  }
 }
 
 export default db;

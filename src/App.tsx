@@ -8,6 +8,7 @@ import { LayoutDashboard, PlusCircle, BookOpen, Settings } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import AddCard from './components/AddCard';
 import Study from './components/Study';
+import DeckView from './components/DeckView';
 
 export default function App() {
   return (
@@ -52,6 +53,7 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/add" element={<AddCard />} />
             <Route path="/study" element={<Study />} />
+            <Route path="/deck/:deckId" element={<DeckView />} />
           </Routes>
         </main>
       </div>

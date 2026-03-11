@@ -2,12 +2,13 @@ import { useState, useRef, useEffect, ChangeEvent } from 'react';
 import { FileImage, FileText, UploadCloud, Loader2, Save, Trash2, CheckCircle2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI } from '@google/genai';
+import PageSelectorModal from './PageSelectorModal';
 
 export default function AddCard() {
-  const [activeTab, setActiveTab] = useState<'text' | 'image'>('image');
+  const [activeTab, setActiveTab] = useState<'text' | 'image' | 'document'>('image');
   const [decks, setDecks] = useState([]);
   const [selectedDeck, setSelectedDeck] = useState('');
-  
+
   // Image Occlusion State
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
@@ -26,6 +27,10 @@ export default function AddCard() {
   const [documentImages, setDocumentImages] = useState<string[]>([]);
   const [documentCards, setDocumentCards] = useState<any[]>([]);
 
+  // Page Selector State
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [showPageSelector, setShowPageSelector] = useState(false);
+
   useEffect(() => {
     fetch('/api/decks')
       .then(res => res.json())
@@ -39,6 +44,31 @@ export default function AddCard() {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    const ext = file.name.toLowerCase();
+    if (ext.endsWith('.pdf') || ext.endsWith('.pptx')) {
+      // Show page selector modal for PDF and PPTX
+      setPendingFile(file);
+      setShowPageSelector(true);
+    } else {
+      // For DOCX or other files, process immediately (no page selection)
+      processDocument(file, null);
+    }
+  };
+
+  const handlePageSelection = async (selectedPages: number[]) => {
+    setShowPageSelector(false);
+    if (pendingFile) {
+      processDocument(pendingFile, selectedPages);
+      setPendingFile(null);
+    }
+  };
+
+  const handlePageSelectorCancel = () => {
+    setShowPageSelector(false);
+    setPendingFile(null);
+  };
+
+  const processDocument = async (file: File, selectedPages: number[] | null) => {
     setIsProcessingDocument(true);
     setDocumentImages([]);
     setDocumentCards([]);
@@ -46,19 +76,22 @@ export default function AddCard() {
     try {
       const formData = new FormData();
       formData.append('document', file);
+      if (selectedPages) {
+        formData.append('pages', JSON.stringify(selectedPages));
+      }
       const res = await fetch('/api/upload-document', {
         method: 'POST',
         body: formData,
       });
       const data = await res.json();
-      
+
       if (data.generatedCards) {
         setDocumentCards(data.generatedCards.map((c: any, i: number) => ({ ...c, id: i.toString(), selected: true })));
       }
       if (data.images) {
         setDocumentImages(data.images);
       }
-      
+
       if ((!data.generatedCards || data.generatedCards.length === 0) && (!data.images || data.images.length === 0)) {
         alert('No text or images could be extracted from this document, or the text was too short to generate flashcards.');
       }
@@ -150,9 +183,9 @@ export default function AddCard() {
 
   const saveDocumentCards = async () => {
     if (!selectedDeck) return;
-    
+
     const selectedCards = documentCards.filter(c => c.selected);
-    
+
     for (const card of selectedCards) {
       await fetch('/api/cards', {
         method: 'POST',
@@ -161,7 +194,8 @@ export default function AddCard() {
           deck_id: selectedDeck,
           type: card.type,
           front: card.front,
-          back: card.back
+          back: card.back,
+          options: card.options || undefined,
         })
       });
     }
@@ -295,19 +329,15 @@ export default function AddCard() {
     
     try {
       const prompt = `
-        Based on the following text, generate 3 high-quality flashcards.
-        Include a mix of Q&A and Cloze (fill-in-the-blank) cards.
-        For Cloze cards, use the format: "The capital of France is {{c1::Paris}}."
-        
-        Return a JSON array of objects:
-        [
-          {
-            "type": "qa" | "cloze",
-            "front": "Question or cloze text",
-            "back": "Answer (empty for cloze)"
-          }
-        ]
-        
+        Based on the following text, generate 5 high-quality flashcards.
+        Include a mix of card types:
+        - "qa": Standard question/answer
+        - "cloze": Fill-in-the-blank using {{c1::hidden text}} format
+        - "open": Open-ended question requiring a written response (front=question, back=model answer)
+        - "multiple_choice": Question with 4 options. Include "options" array: [{"text": "...", "correct": true/false}]. Exactly one correct.
+
+        Return a JSON array of objects with: type, front, back, and optionally options (for multiple_choice only).
+
         Text:
         ${inputText}
       `;
@@ -335,9 +365,9 @@ export default function AddCard() {
 
   const saveGeneratedCards = async () => {
     if (!selectedDeck) return;
-    
+
     const selectedCards = generatedCards.filter(c => c.selected);
-    
+
     for (const card of selectedCards) {
       await fetch('/api/cards', {
         method: 'POST',
@@ -346,7 +376,8 @@ export default function AddCard() {
           deck_id: selectedDeck,
           type: card.type,
           front: card.front,
-          back: card.back
+          back: card.back,
+          options: card.options || undefined,
         })
       });
     }
@@ -446,19 +477,28 @@ export default function AddCard() {
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       {documentCards.map((card) => (
-                        <div 
-                          key={card.id} 
+                        <div
+                          key={card.id}
                           onClick={() => setDocumentCards(cards => cards.map(c => c.id === card.id ? { ...c, selected: !c.selected } : c))}
                           className={`p-4 rounded-xl border-2 cursor-pointer transition-all ${card.selected ? 'border-indigo-600 bg-indigo-50/30' : 'border-zinc-200 hover:border-indigo-300'}`}
                         >
                           <div className="flex justify-between items-start mb-2">
                             <span className="text-xs font-bold uppercase tracking-wider text-indigo-600 bg-indigo-100 px-2 py-1 rounded-md">
-                              {card.type === 'qa' ? 'Q&A' : 'Cloze'}
+                              {card.type === 'qa' ? 'Q&A' : card.type === 'cloze' ? 'Cloze' : card.type === 'open' ? 'Open' : 'MC'}
                             </span>
                             {card.selected && <CheckCircle2 className="w-5 h-5 text-indigo-600" />}
                           </div>
                           <p className="font-medium text-zinc-900 mt-2">{card.front}</p>
                           {card.back && <p className="text-sm text-zinc-500 mt-2 pt-2 border-t border-zinc-200/50">{card.back}</p>}
+                          {card.type === 'multiple_choice' && card.options && (
+                            <div className="mt-2 pt-2 border-t border-zinc-200/50 grid grid-cols-2 gap-1">
+                              {(Array.isArray(card.options) ? card.options : []).map((opt: any, idx: number) => (
+                                <span key={idx} className={`text-xs px-2 py-1 rounded ${opt.correct ? 'bg-emerald-100 text-emerald-700 font-medium' : 'bg-zinc-100 text-zinc-600'}`}>
+                                  {String.fromCharCode(65 + idx)}. {opt.text}
+                                </span>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -635,19 +675,28 @@ export default function AddCard() {
                 
                 <div className="grid gap-4">
                   {generatedCards.map((card) => (
-                    <div 
-                      key={card.id} 
+                    <div
+                      key={card.id}
                       className={`p-4 rounded-xl border transition-all cursor-pointer ${card.selected ? 'border-indigo-500 bg-indigo-50/30' : 'border-zinc-200 bg-white hover:border-zinc-300'}`}
                       onClick={() => setGeneratedCards(cards => cards.map(c => c.id === card.id ? { ...c, selected: !c.selected } : c))}
                     >
                       <div className="flex justify-between items-start mb-2">
                         <span className="text-xs font-bold uppercase tracking-wider text-indigo-600 bg-indigo-100 px-2 py-1 rounded-md">
-                          {card.type === 'qa' ? 'Q&A' : 'Cloze'}
+                          {card.type === 'qa' ? 'Q&A' : card.type === 'cloze' ? 'Cloze' : card.type === 'open' ? 'Open' : card.type === 'multiple_choice' ? 'MC' : card.type}
                         </span>
                         {card.selected && <CheckCircle2 className="w-5 h-5 text-indigo-600" />}
                       </div>
                       <p className="font-medium text-zinc-900 mt-2">{card.front}</p>
                       {card.back && <p className="text-sm text-zinc-600 mt-2 pt-2 border-t border-zinc-200/60">{card.back}</p>}
+                      {card.type === 'multiple_choice' && card.options && (
+                        <div className="mt-2 pt-2 border-t border-zinc-200/50 grid grid-cols-2 gap-1">
+                          {(Array.isArray(card.options) ? card.options : []).map((opt: any, idx: number) => (
+                            <span key={idx} className={`text-xs px-2 py-1 rounded ${opt.correct ? 'bg-emerald-100 text-emerald-700 font-medium' : 'bg-zinc-100 text-zinc-600'}`}>
+                              {String.fromCharCode(65 + idx)}. {opt.text}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -656,6 +705,15 @@ export default function AddCard() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Page Selector Modal */}
+      {showPageSelector && pendingFile && (
+        <PageSelectorModal
+          file={pendingFile}
+          onConfirm={handlePageSelection}
+          onCancel={handlePageSelectorCancel}
+        />
+      )}
     </div>
   );
 }
